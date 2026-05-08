@@ -1,0 +1,82 @@
+services:
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    container_name: sovereign_dragonfly
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    networks:
+      - sovereign_net
+
+  shm_dragonfly_bridge:
+    build:
+      context: ..
+      dockerfile: breakout_dashboard_v2_repo/breakout_dashboard_v2/Dockerfile
+    container_name: sovereign_shm_dragonfly_bridge
+    restart: unless-stopped
+    env_file:
+      - ../RS_PROJECT/stock_scanner_sovereign/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/stock_scanner_sovereign/frontend_reflex:/app/stock_scanner_sovereign:/app/breakout_dashboard_v2
+      - DRAGONFLY_HOST=dragonfly
+      - DRAGONFLY_PORT=6379
+      - DRAGONFLY_KEY_PREFIX=live
+      - DRAGONFLY_HEARTBEAT_KEY=live:heartbeat
+      - SHM_MMAP_PATH=/app/stock_scanner_sovereign/scanner_results.mmap
+      - SHM_INDEX_MAP_PATH=/app/stock_scanner_sovereign/symbols_idx_map.json
+      - SHM_BRIDGE_POLL_SEC=0.5
+      - SHM_BRIDGE_BATCH_SIZE=500
+      - SHM_BRIDGE_MAX_ROWS=10000
+    volumes:
+      - ../RS_PROJECT/stock_scanner_sovereign:/app/stock_scanner_sovereign:ro
+      - ./breakout_dashboard_v2:/app/breakout_dashboard_v2
+    working_dir: /app/breakout_dashboard_v2
+    command: ["python", "/app/breakout_dashboard_v2/scripts/shm_to_dragonfly_bridge.py"]
+    depends_on:
+      - dragonfly
+    networks:
+      - sovereign_net
+
+  dashboard_breakout_v2:
+    build:
+      context: ..
+      dockerfile: breakout_dashboard_v2_repo/breakout_dashboard_v2/Dockerfile
+    container_name: sovereign_dashboard_breakout_v2
+    user: "1000:1000"
+    command: ["reflex", "run", "--env", "prod", "--backend-host", "0.0.0.0", "--loglevel", "info"]
+    restart: unless-stopped
+    env_file:
+      - ../RS_PROJECT/stock_scanner_sovereign/.env
+    environment:
+      - API_URL=${BREAKOUT_V2_API_URL:-http://localhost:3002}
+      - DB_HOST=db
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/stock_scanner_sovereign/frontend_reflex:/app/stock_scanner_sovereign:/app/breakout_dashboard_v2
+      - HOME=/app/stock_scanner_sovereign
+      - PIPELINE_DATA_DIR=/app/data/historical
+      - BREAKOUT_V2_STORAGE_DATA_ROOT=/app/stock_scanner_sovereign/data
+      - BREAKOUT_V2_SCANNER_API_URL=${BREAKOUT_V2_SCANNER_API_URL:-}
+      - BREAKOUT_V2_ENABLE_SHM=${BREAKOUT_V2_ENABLE_SHM:-1}
+      - BREAKOUT_V2_LIVE_SOURCE=${BREAKOUT_V2_LIVE_SOURCE:-shm}
+      - BREAKOUT_V2_DATA_MODE=${BREAKOUT_V2_DATA_MODE:-storage_only}
+      - DASHBOARD_POLL_INTERVAL_SEC=${BREAKOUT_V2_DASHBOARD_POLL_INTERVAL_SEC:-1}
+      - DASHBOARD_BREAKOUT_LOOP=0
+    volumes:
+      - ../RS_PROJECT/stock_scanner_sovereign:/app/stock_scanner_sovereign:ro
+      - ./runtime/scanner_engine.log:/app/stock_scanner_sovereign/scanner_engine.log
+      - ./breakout_dashboard_v2:/app/breakout_dashboard_v2
+      - ../RS_PROJECT/fyers_data_pipeline/data/historical:/app/data/historical:ro
+    working_dir: /app/breakout_dashboard_v2
+    ports:
+      - "3002:3000"
+      - "8002:8000"
+    cpus: "1.0"
+    mem_limit: 1024m
+    networks:
+      - sovereign_net
+
+networks:
+  sovereign_net:
+    name: rs_project_sovereign_net
+    external: true

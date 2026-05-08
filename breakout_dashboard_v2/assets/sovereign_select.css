@@ -1,0 +1,9 @@
+/* Long sector list: bounded menu height, scroll inside (avoids fighting the sidebar / page). */
+[data-radix-select-content],
+.rt-SelectContent {
+  max-height: min(70vh, 26rem);
+}
+[data-radix-select-viewport] {
+  max-height: inherit;
+}
+

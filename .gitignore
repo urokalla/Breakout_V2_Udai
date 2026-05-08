@@ -1,0 +1,9 @@
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.log
+runtime/*.log
+runtime/dragonfly_parity_summary_*.json
+breakout_dashboard_v2/runtime/dragonfly_parity_summary_*.json
