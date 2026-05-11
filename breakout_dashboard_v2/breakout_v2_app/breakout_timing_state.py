@@ -2,6 +2,7 @@ import reflex as rx
 import time
 import asyncio
 import os
+import gc
 from datetime import datetime, timezone
 
 from .engine import get_engine
@@ -45,6 +46,27 @@ class BreakoutClockState(rx.State):
     ops_src_db: int = 0
     ops_src_api: int = 0
     ops_src_na: int = 0
+    structural_today_count: int = 0
+    structural_today_b: int = 0
+    structural_today_e9ct: int = 0
+    structural_today_et9: int = 0
+    structural_today_e21c: int = 0
+    structural_today_rst: int = 0
+    _sorted_symbol_cache_key: str = ""
+    _sorted_symbols: list[str] = []
+
+    @staticmethod
+    def _debug_enabled() -> bool:
+        return str(os.getenv("BREAKOUT_V2_DEBUG_TIMING", "") or "").strip().lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def _dbg(msg: str) -> None:
+        if not BreakoutClockState._debug_enabled():
+            return
+        try:
+            print(f"[breakout_v2_dbg] {msg}", flush=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _is_live_struct_mismatch(last_tag: str, live_struct_d: str) -> bool:
@@ -52,13 +74,26 @@ class BreakoutClockState(rx.State):
         live = str(live_struct_d or "").strip().upper()
         if not tag or not live:
             return False
+        # Composite structural Bn+E9CT: live_struct often confirms Bn only (B stage), not the full tag string.
+        # Example: Last Tag D = B4+E9CT, Live_struct_d = B4_CONFIRMED — not a mismatch.
+        b_base = ""
+        if "+E9CT" in tag:
+            b_base = tag.split("+", 1)[0].strip()
         # Only validate resolved EOD outcomes; intraday watch/invalid states are allowed drift.
         if "_CONFIRMED(" in live:
             lhs = live.split("_CONFIRMED(", 1)[0].strip()
-            return bool(lhs) and lhs != tag
+            if not lhs:
+                return False
+            if b_base and lhs == b_base:
+                return False
+            return lhs != tag
         if live.endswith("_CONFIRMED"):
             lhs = live[: -len("_CONFIRMED")].strip()
-            return bool(lhs) and lhs != tag
+            if not lhs:
+                return False
+            if b_base and lhs == b_base:
+                return False
+            return lhs != tag
         return False
 
     @rx.var
@@ -80,12 +115,20 @@ class BreakoutClockState(rx.State):
                 return
             self.auto_refresh_started = True
         try:
-            # Keep parity with main dashboard cadence during market hours.
-            poll_sec = max(0.5, float(os.getenv("DASHBOARD_POLL_INTERVAL_SEC", "1")))
+            base_poll_sec = max(0.5, float(os.getenv("DASHBOARD_POLL_INTERVAL_SEC", "1")))
         except Exception:
-            poll_sec = 1.0
+            base_poll_sec = 1.0
 
         while True:
+            # Nifty500+ can be expensive to snapshot + filter + sort every second.
+            # Slow the cadence automatically when universe is large.
+            async with self:
+                n = int(self.symbol_count_total or 0)
+            poll_sec = float(base_poll_sec)
+            if n >= 400:
+                poll_sec = max(poll_sec, 5.0)
+            elif n >= 200:
+                poll_sec = max(poll_sec, 3.0)
             await asyncio.sleep(poll_sec)
             async with self:
                 self.poll_heartbeat += 1
@@ -138,20 +181,68 @@ class BreakoutClockState(rx.State):
         return out
 
     def _reload(self):
+        t0 = time.perf_counter()
         snap = get_engine().snapshot(universe=self.universe)
+        t1 = time.perf_counter()
+        if self._debug_enabled():
+            phases = snap.get("_debug_snapshot_phases_ms") if isinstance(snap, dict) else None
+            if isinstance(phases, dict) and phases:
+                self._dbg(
+                    "snapshot_phases "
+                    + " ".join(f"{k}={int(v)}ms" for k, v in phases.items())
+                )
         rows_all = snap.get("daily_rows", []) if self.clock_timeframe == "daily" else snap.get("weekly_rows", [])
+        t2 = time.perf_counter()
+        sym_map = {str(r.get("symbol", "")).upper(): r for r in rows_all if str(r.get("symbol", "")).strip()}
+        # Structural "did something today" counters should be computed on the full universe,
+        # after EOD sync, independent of UI filters/search/pagination.
+        if self.clock_timeframe == "daily":
+            today_rows = [r for r in rows_all if bool(r.get("last_tag_is_today_event"))]
+            self.structural_today_count = len(today_rows)
+            def _tag(x: dict) -> str:
+                return str(x.get("last_tag", "") or "").strip().upper()
+            self.structural_today_b = len([r for r in today_rows if _tag(r).startswith("B")])
+            self.structural_today_e9ct = len([r for r in today_rows if _tag(r).startswith("E9CT")])
+            self.structural_today_et9 = len([r for r in today_rows if _tag(r) == "ET9DNWF21C"])
+            self.structural_today_e21c = len([r for r in today_rows if _tag(r).startswith("E21C")])
+            self.structural_today_rst = len([r for r in today_rows if _tag(r) == "RST"])
         rows = rows_all
+        t3 = time.perf_counter()
         rows = self._apply_filters(rows)
+        t4 = time.perf_counter()
         # Counter should represent actual live-struct presence, not breakout tag count.
         live_struct_total = len([r for r in rows if bool(str(r.get("live_struct_d", "")).strip())])
         q = (self.search_query or "").strip().upper()
         if q:
             rows = [r for r in rows if q in str(r.get("symbol", "")).upper()]
         key = self.sort_timing_key or "symbol"
-        try:
-            rows = sorted(rows, key=lambda r: r.get(key, ""), reverse=self.sort_timing_desc)
-        except Exception:
-            pass
+        cache_key = "|".join(
+            [
+                str(self.clock_timeframe),
+                str(self.universe),
+                str(self.timing_filter),
+                str(self.filter_brk_stage),
+                str(self.filter_mrs_grid),
+                str(self.filter_wmrs_slope),
+                str(self.filter_m_rsi2),
+                str(self.filter_profile),
+                q,
+                str(key),
+                "desc" if self.sort_timing_desc else "asc",
+            ]
+        )
+        if cache_key == self._sorted_symbol_cache_key and self._sorted_symbols:
+            rows = [sym_map[s] for s in self._sorted_symbols if s in sym_map]
+            cache_hit = True
+        else:
+            try:
+                rows = sorted(rows, key=lambda r: r.get(key, ""), reverse=self.sort_timing_desc)
+            except Exception:
+                pass
+            self._sorted_symbol_cache_key = cache_key
+            self._sorted_symbols = [str(r.get("symbol", "")).upper() for r in rows if str(r.get("symbol", "")).strip()]
+            cache_hit = False
+        t5 = time.perf_counter()
         self.total_count = len(rows)
         if self.current_page > self.total_pages:
             self.current_page = self.total_pages
@@ -192,9 +283,30 @@ class BreakoutClockState(rx.State):
             self.ops_src_api = len([r for r in rows_all if str(r.get("quote_source", "")).strip().lower() not in ("", "scanner_shm", "postgres_live_state", "placeholder")])
             self.ops_src_na = len([r for r in rows_all if str(r.get("quote_source", "")).strip().lower() in ("", "placeholder")])
 
+        # Debug timing + GC pressure hints (no external deps).
+        if self._debug_enabled():
+            try:
+                gc_counts = gc.get_count()
+            except Exception:
+                gc_counts = (0, 0, 0)
+            self._dbg(
+                "reload "
+                f"universe={self.universe!r} tf={self.timing_filter!r} "
+                f"rows_all={len(rows_all)} rows_filtered={len(rows)} "
+                f"cache_hit={cache_hit} "
+                f"t_snapshot_ms={int((t1-t0)*1000)} "
+                f"t_rows_ms={int((t2-t1)*1000)} "
+                f"t_filter_ms={int((t4-t3)*1000)} "
+                f"t_sort_ms={int((t5-t4)*1000)} "
+                f"t_total_ms={int((t5-t0)*1000)} "
+                f"gc={gc_counts}"
+            )
+
     @staticmethod
     def _format_row(r: dict) -> dict:
         sym = r.get("symbol", "")
+        sym_tv = str(sym or "").strip().upper()
+        tv_href = f"https://www.tradingview.com/chart/?symbol=NSE:{sym_tv}" if sym_tv else "#"
         last = r.get("last", "—")
         ref = r.get("ref", "—")
         is_breakout = bool(r.get("is_breakout"))
@@ -233,6 +345,7 @@ class BreakoutClockState(rx.State):
             src_color = "#777777"
         return {
             "symbol": sym,
+            "tv_href": tv_href,
             "setup_score_ui": f"{r.get('bars', 0)}",
             "setup_score_color": "#00FF00" if is_breakout else "#D1D1D1",
             "ltp": f"{last}",
@@ -382,12 +495,6 @@ class BreakoutClockState(rx.State):
     def prev_page(self):
         self.current_page = max(1, self.current_page - 1)
         self._reload()
-
-    def open_tradingview(self, symbol: str):
-        s = str(symbol or "").strip().upper()
-        if not s:
-            return
-        return rx.redirect(f"https://www.tradingview.com/chart/?symbol=NSE:{s}", is_external=True)
 
     def download_excel(self):
         return rx.window_alert("Export is not yet enabled in v2 storage-only mode.")

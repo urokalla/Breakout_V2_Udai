@@ -1,3 +1,5 @@
+# CPU / memory caps (Compose): override from shell or a `.env` next to this file, e.g.
+#   BREAKOUT_V2_DASHBOARD_CPUS=1.5 BREAKOUT_V2_DASHBOARD_MEM_LIMIT=1536m docker compose ...
 services:
   dragonfly:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
@@ -5,6 +7,8 @@ services:
     restart: unless-stopped
     ports:
       - "6380:6379"
+    cpus: ${BREAKOUT_V2_DRAGONFLY_CPUS:-0.5}
+    mem_limit: ${BREAKOUT_V2_DRAGONFLY_MEM_LIMIT:-512m}
     networks:
       - sovereign_net
 
@@ -35,6 +39,8 @@ services:
     command: ["python", "/app/breakout_dashboard_v2/scripts/shm_to_dragonfly_bridge.py"]
     depends_on:
       - dragonfly
+    cpus: ${BREAKOUT_V2_BRIDGE_CPUS:-0.25}
+    mem_limit: ${BREAKOUT_V2_BRIDGE_MEM_LIMIT:-384m}
     networks:
       - sovereign_net
 
@@ -61,6 +67,9 @@ services:
       - BREAKOUT_V2_LIVE_SOURCE=${BREAKOUT_V2_LIVE_SOURCE:-shm}
       - BREAKOUT_V2_DATA_MODE=${BREAKOUT_V2_DATA_MODE:-storage_only}
       - DASHBOARD_POLL_INTERVAL_SEC=${BREAKOUT_V2_DASHBOARD_POLL_INTERVAL_SEC:-1}
+      - BREAKOUT_V2_DEBUG_TIMING=${BREAKOUT_V2_DEBUG_TIMING:-0}
+      # Optional only: reuse snapshot up to N sec (can show slightly stale rows). Default 0 = always full recompute.
+      - BREAKOUT_V2_SNAPSHOT_CACHE_SEC=${BREAKOUT_V2_SNAPSHOT_CACHE_SEC:-0}
       - DASHBOARD_BREAKOUT_LOOP=0
     volumes:
       - ../RS_PROJECT/stock_scanner_sovereign:/app/stock_scanner_sovereign:ro
@@ -71,8 +80,13 @@ services:
     ports:
       - "3002:3000"
       - "8002:8000"
-    cpus: "1.0"
-    mem_limit: 1024m
+    cpus: ${BREAKOUT_V2_DASHBOARD_CPUS:-1.0}
+    mem_limit: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-1024m}
+    deploy:
+      resources:
+        limits:
+          cpus: ${BREAKOUT_V2_DASHBOARD_CPUS:-1.0}
+          memory: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-1024m}
     networks:
       - sovereign_net
 

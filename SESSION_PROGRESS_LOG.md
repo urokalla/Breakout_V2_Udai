@@ -954,3 +954,18 @@ Purpose: keep an always-current checkpoint so work can resume after chat/session
 - **Next immediate action**
   - Continue `Live_struct_d` progression/reconciliation implementation and add explicit event audit text where needed.
 
+### 2026-05-11 09:02 (UTC+2) - Block stale-day B/E tags from showing LIVE_WATCH
+
+- **What I did**
+  - Fixed `Live_struct_d` day-gating in daily transition logic to align with intended live structural breakout semantics.
+  - Added explicit guard so intraday states (`*_LIVE_WATCH`, `*_NO_MORE_VALID`) are only computed when `structural_event_key` equals today's IST day key.
+  - Added stale cleanup: when structural event key is not today, existing stale intraday watch states are cleared instead of being retained.
+  - This prevents cases like `Last Tag D = B6` from an older date showing `B6_LIVE_WATCH` today.
+- **Files touched/read**
+  - Updated: `breakout_dashboard_v2/breakout_v2_app/logic/daily_transition.py`
+  - Updated: `SESSION_PROGRESS_LOG.md`
+- **Where I stopped**
+  - Code patch applied successfully; no linter issues in the updated transition file.
+- **Next immediate action**
+  - Restart/recreate V2 dashboard container and verify sample symbols (e.g., ADANIENT) no longer show stale-day `*_LIVE_WATCH`.
+

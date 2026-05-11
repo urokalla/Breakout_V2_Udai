@@ -64,14 +64,16 @@ def breakout_timing_daily_data_grid():
             S.results,
             lambda r: rx.table.row(
                 rx.table.cell(
-                    rx.text(
+                    rx.link(
                         r["symbol"],
+                        href=r.get("tv_href", "#"),
+                        is_external=True,
                         color="#FFB000",
                         font_weight="bold",
                         font_size="11px",
-                        cursor="pointer",
                         text_decoration="underline",
-                        on_click=S.open_tradingview(r["symbol"]),
+                        cursor="pointer",
+                        _hover={"opacity": "0.85"},
                     ),
                     padding_y="0",
                 ),
@@ -202,14 +204,16 @@ def breakout_timing_weekly_data_grid():
             S.results,
             lambda r: rx.table.row(
                 rx.table.cell(
-                    rx.text(
+                    rx.link(
                         r["symbol"],
+                        href=r.get("tv_href", "#"),
+                        is_external=True,
                         color="#FFB000",
                         font_weight="bold",
                         font_size="11px",
-                        cursor="pointer",
                         text_decoration="underline",
-                        on_click=S.open_tradingview(r["symbol"]),
+                        cursor="pointer",
+                        _hover={"opacity": "0.85"},
                     ),
                     padding_y="0",
                 ),

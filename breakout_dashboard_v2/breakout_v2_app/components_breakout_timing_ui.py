@@ -251,6 +251,28 @@ def breakout_timing_daily_sidebar():
             height="32px",
         ),
         rx.box(height="8px"),
+        rx.vstack(
+            rx.text("POST EOD (STRUCTURAL TODAY)", size="1", color="#D1D1D1", font_weight="bold"),
+            rx.hstack(
+                rx.text(f"TODAY {BreakoutTimingDailyState.structural_today_count}", color="#00E5FF", font_weight="bold", font_size="12px"),
+                rx.text(f"B {BreakoutTimingDailyState.structural_today_b}", color="#00FF00", font_size="11px"),
+                rx.text(f"E9 {BreakoutTimingDailyState.structural_today_e9ct}", color="#4FD1C5", font_size="11px"),
+                rx.text(f"ET9 {BreakoutTimingDailyState.structural_today_et9}", color="#FFB000", font_size="11px"),
+                rx.text(f"E21 {BreakoutTimingDailyState.structural_today_e21c}", color="#AB47BC", font_size="11px"),
+                rx.text(f"RST {BreakoutTimingDailyState.structural_today_rst}", color="#FF4D4F", font_size="11px"),
+                spacing="2",
+                flex_wrap="wrap",
+            ),
+            rx.text(
+                "Count of symbols whose WHEN(D) date equals the latest EOD day key.",
+                size="1",
+                color="#666666",
+            ),
+            spacing="1",
+            padding="0 15px",
+            align_items="start",
+        ),
+        rx.box(height="8px"),
         rx.text("TIMING FILTER (DAILY)", size="1", color="#D1D1D1", font_weight="bold", padding="8px 15px 4px 15px"),
         rx.select(
             timing_opts,

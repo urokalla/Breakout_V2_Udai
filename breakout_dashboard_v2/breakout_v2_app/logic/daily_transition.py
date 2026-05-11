@@ -42,6 +42,167 @@ def _extract_e_stage(tag: str) -> str:
 def _state_text(x: Any) -> str:
     return str(x or "").strip()
 
+def _live_token_from_live_struct(s: str) -> str:
+    """
+    Extract the live-truth tag token from an intraday live_struct value.
+
+    Examples:
+    - B2_LIVE_WATCH -> B2
+    - E9CT1_NO_MORE_VALID -> E9CT1
+    - ET9DNWF21C_LIVE_WATCH -> ET9DNWF21C
+    - RST_LIVE -> RST
+    """
+    t = _state_text(s).upper()
+    if not t:
+        return ""
+    if t.endswith("_LIVE_WATCH"):
+        return t[: -len("_LIVE_WATCH")].strip()
+    if t.endswith("_NO_MORE_VALID"):
+        return t[: -len("_NO_MORE_VALID")].strip()
+    if t == "RST_LIVE":
+        return "RST"
+    return ""
+
+def _attempt_is_for_prev_evk(attempt_started_at: str, prev_evk: str) -> bool:
+    """
+    Guardrail: only treat `live_attempt_tag` as live truth for EOD reconcile
+    if it was started on the same structural day key we are reconciling from.
+    """
+    a = _state_text(attempt_started_at)
+    p = _state_text(prev_evk)
+    if not a or not p or len(p) < 10:
+        return False
+    return a[:10] == p[:10]
+
+
+def _parse_b_num(tag: str) -> int | None:
+    t = _state_text(tag).upper()
+    if not t.startswith("B"):
+        return None
+    digits = []
+    for ch in t[1:]:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    if not digits:
+        return None
+    try:
+        return int("".join(digits))
+    except Exception:
+        return None
+
+
+def _parse_e9ct_num(tag: str) -> int | None:
+    t = _state_text(tag).upper()
+    if not t.startswith("E9CT"):
+        return None
+    tail = t[4:]
+    if not tail or not tail[0].isdigit():
+        return None
+    digits = []
+    for ch in tail:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    try:
+        return int("".join(digits))
+    except Exception:
+        return None
+
+
+def _parse_e21c_num(tag: str) -> int | None:
+    t = _state_text(tag).upper()
+    if not t.startswith("E21C"):
+        return None
+    tail = t[4:]
+    if not tail or not tail[0].isdigit():
+        return None
+    digits = []
+    for ch in tail:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    try:
+        return int("".join(digits))
+    except Exception:
+        return None
+
+
+def _eod_failed_attempt_inner_token(new_tag: str, prev_tag: str, attempt_tag: str) -> str:
+    """
+    Token inside CONFIRMED(<token>_LIVE_FAILED) at EOD mismatch.
+
+    If structural is now ET9DNWF21C after E21Cn, live_attempt often still reads E21Cn from
+    tracking that *prior* structural rung — that is not a fresh "E21Cn failed" try; the
+    continuation rung is E21C(n+1). (Stale intraday tag off-market reconcile.)
+    """
+    nt = _state_text(new_tag).upper()
+    pt = _state_text(prev_tag).upper()
+    at = _state_text(attempt_tag).upper()
+    if nt != "ET9DNWF21C":
+        return at
+    pn = _parse_e21c_num(pt)
+    an = _parse_e21c_num(at)
+    if pn is not None and an is not None and an == pn:
+        return f"E21C{pn + 1}"
+    return at
+
+
+def _is_progression_predecessor(structural_tag: str, failed_attempt_tag: str) -> bool:
+    st = _state_text(structural_tag).upper()
+    fa = _state_text(failed_attempt_tag).upper()
+    if not st or not fa:
+        return False
+
+    sb = _parse_b_num(st)
+    fb = _parse_b_num(fa)
+    if sb is not None and fb is not None and fb == sb - 1:
+        return True
+
+    se9 = _parse_e9ct_num(st)
+    fe9 = _parse_e9ct_num(fa)
+    if se9 is not None and fa.startswith("B"):
+        return True
+    if se9 is not None and fe9 is not None and fe9 == se9 - 1:
+        return True
+
+    if st == "ET9DNWF21C" and (fa.startswith("E9CT") or fa.startswith("B")):
+        return True
+
+    se21 = _parse_e21c_num(st)
+    fe21 = _parse_e21c_num(fa)
+    # Do not treat ET9DNWF21C as a progression predecessor of E21Cn for normalization:
+    # E21Cn_CONFIRMED(ET9DNWF21C_FAILED) is a real live-vs-structural story, not legacy B1/B2 noise.
+    if se21 is not None and fe21 is not None and fe21 == se21 - 1:
+        return True
+
+    return False
+
+
+def _normalize_resolved_live_struct(tag: str, live_struct: str) -> str:
+    """
+    Normalize known invalid legacy reconciliations.
+    Example: B2_CONFIRMED(B1_FAILED) -> B2_CONFIRMED.
+    Previous structural stage (B1) is progression history, not today's failed live attempt.
+    """
+    t = _state_text(tag).upper()
+    s = _state_text(live_struct).upper()
+    if not t or not s:
+        return _state_text(live_struct)
+    confirmed_prefix = f"{t}_CONFIRMED("
+    if s.startswith(confirmed_prefix) and s.endswith(")"):
+        inner = s[len(confirmed_prefix) : -1].strip()
+        for suf in ("_LIVE_FAILED", "_FAILED"):
+            if inner.endswith(suf):
+                failed_attempt = inner[: -len(suf)].strip()
+                if _is_progression_predecessor(t, failed_attempt):
+                    return f"{t}_CONFIRMED"
+                break
+    return _state_text(live_struct)
+
 
 def compute_live_struct_d(
     *,
@@ -90,35 +251,80 @@ def compute_live_struct_d(
 
     prev_live_struct = _state_text(prev.get("live_struct_d", ""))
 
+    reconcile_symptom: Dict[str, Any] | None = None
+
     # If EOD structural truth changed, reconcile prior live attempt to structural truth.
     structural_changed = (tag != prev_tag) or (evk != prev_evk)
-    if structural_changed and attempt_tag:
-        now_iso_reconcile = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
-        structural_b = _extract_b_stage(tag)
-        structural_e = _extract_e_stage(tag)
-        if (structural_b and structural_b == attempt_tag) or (structural_e and structural_e == attempt_tag):
-            # Example: B2_LIVE_WATCH -> B2_CONFIRMED after EOD structural close.
-            d["live_struct_d"] = f"{attempt_tag}_CONFIRMED"
-            attempt_status = "confirmed"
-            attempt_reason = "eod_reconcile_confirmed"
-        else:
-            # Example: B2_LIVE_WATCH -> ET9DNWF21C_CONFIRMED(B2_FAILED)
-            if tag and tag != "—":
-                d["live_struct_d"] = f"{tag}_CONFIRMED({attempt_tag}_FAILED)"
+    if structural_changed:
+        live_token = _live_token_from_live_struct(prev_live_struct)
+        live_token_source = "prev_live_struct"
+        if not live_token and attempt_tag and _attempt_is_for_prev_evk(attempt_started_at, prev_evk):
+            live_token = _state_text(attempt_tag).upper()
+            live_token_source = "attempt_tag_same_day"
+
+        # No live truth for that session day: do not manufacture a failure from stale tags.
+        if not live_token:
+            if prev_live_struct:
+                d["live_struct_d"] = _normalize_resolved_live_struct(tag, prev_live_struct)
             else:
-                d["live_struct_d"] = f"{attempt_tag}_FAILED"
-            attempt_status = "failed"
-            attempt_reason = f"eod_reconcile_to_{tag or 'UNKNOWN'}"
-            if not attempt_invalidated_at:
-                attempt_invalidated_at = now_iso_reconcile
+                d["live_struct_d"] = ""
+        else:
+            now_iso_reconcile = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+            structural_b = _extract_b_stage(tag)
+            structural_e = _extract_e_stage(tag)
+            failed_attempt = f"{live_token}_LIVE_FAILED"
+            if (structural_b and structural_b == live_token) or (structural_e and structural_e == live_token):
+                # Example: B2_LIVE_WATCH -> B2_CONFIRMED after EOD structural close.
+                d["live_struct_d"] = f"{live_token}_CONFIRMED"
+                attempt_status = "confirmed"
+                attempt_reason = "eod_reconcile_confirmed"
+                reconcile_symptom = {
+                    "ts_ist": now_iso_reconcile,
+                    "branch": "confirmed_match",
+                    "new_tag": tag,
+                    "new_evk": evk,
+                    "prev_tag": prev_tag,
+                    "prev_evk": prev_evk,
+                    "live_attempt_tag": attempt_tag,
+                    "live_token": live_token,
+                    "live_token_source": live_token_source,
+                    "prev_live_struct": prev_live_struct,
+                    "live_struct_d_out": d.get("live_struct_d", ""),
+                }
+            else:
+                # Example: B6_LIVE_WATCH -> B5_CONFIRMED(B6_LIVE_FAILED)
+                if tag and tag != "—":
+                    d["live_struct_d"] = f"{tag}_CONFIRMED({failed_attempt})"
+                else:
+                    d["live_struct_d"] = failed_attempt
+                attempt_status = "failed"
+                attempt_reason = f"eod_reconcile_to_{tag or 'UNKNOWN'}"
+                if not attempt_invalidated_at:
+                    attempt_invalidated_at = now_iso_reconcile
+                reconcile_symptom = {
+                    "ts_ist": now_iso_reconcile,
+                    "branch": "failed_mismatch",
+                    "new_tag": tag,
+                    "new_evk": evk,
+                    "prev_tag": prev_tag,
+                    "prev_evk": prev_evk,
+                    "live_attempt_tag": attempt_tag,
+                    "live_token": live_token,
+                    "live_token_source": live_token_source,
+                    "prev_live_struct": prev_live_struct,
+                    "structural_b": structural_b,
+                    "structural_e": structural_e,
+                    "failed_attempt_token": failed_attempt,
+                    "live_struct_d_out": d.get("live_struct_d", ""),
+                }
+        # (end structural_changed reconcile)
     elif prev_live_struct:
-        d["live_struct_d"] = prev_live_struct
+        d["live_struct_d"] = _normalize_resolved_live_struct(tag, prev_live_struct)
 
     # Restore prior live-struct session fields (durable state) only when structural truth is same.
     pmeta = prev if isinstance(prev, dict) else {}
     if not structural_changed:
         for k in (
-            "live_struct_d",
             "lsd_latch",
             "lsd_ist_day",
             "lsd_ge9",
@@ -148,59 +354,81 @@ def compute_live_struct_d(
     # live_struct_d depends on Last Tag D truth, so do not advance when structural truth is unresolved.
     structural_ready = (tag != "—") and (evk not in ("", "-"))
     if structural_ready and market_open and quote_fresh:
-        ema9 = float(d.get("ema9_d", 0.0) or 0.0)
-        price = float(ltp or 0.0)
-        b_stage = _extract_b_stage(tag)
-        e_stage = _extract_e_stage(tag)
-        # Independent V2 daily live-struct rule: structural tag + live price regime vs EMA9.
-        if tag.startswith("B"):
-            if b_stage and attempt_tag != b_stage:
-                attempt_tag = b_stage
-                attempt_started_at = now_iso
-                attempt_invalidated_at = ""
-                attempt_status = "valid"
-                attempt_reason = "live_watch_started"
-            if b_stage:
-                if price >= ema9:
-                    d["live_struct_d"] = f"{b_stage}_LIVE_WATCH"
+        # Intraday latch: first live_struct_d observed for the structural day key
+        # is treated as the stable filterable truth for that day. Validity can be
+        # tracked separately via attempt_status / track day.
+        day_key = _state_text(evk)
+        prev_day_key = _state_text(d.get("lsd_day_key", ""))
+        if day_key and prev_day_key and prev_day_key != day_key:
+            d["lsd_latch"] = ""
+            d["lsd_day_status"] = ""
+            d["lsd_day_key"] = day_key
+        elif day_key and not prev_day_key:
+            d["lsd_day_key"] = day_key
+
+        latched = _state_text(d.get("lsd_latch", ""))
+        if latched:
+            d["live_struct_d"] = latched
+        else:
+            ema9 = float(d.get("ema9_d", 0.0) or 0.0)
+            price = float(ltp or 0.0)
+            b_stage = _extract_b_stage(tag)
+            e_stage = _extract_e_stage(tag)
+            # Independent V2 daily live-struct rule: structural tag + live price regime vs EMA9.
+            if tag.startswith("B"):
+                if b_stage and attempt_tag != b_stage:
+                    attempt_tag = b_stage
+                    attempt_started_at = now_iso
+                    attempt_invalidated_at = ""
                     attempt_status = "valid"
-                    attempt_reason = "live_watch_active"
+                    attempt_reason = "live_watch_started"
+                if b_stage:
+                    if price >= ema9:
+                        d["live_struct_d"] = f"{b_stage}_LIVE_WATCH"
+                        attempt_status = "valid"
+                        attempt_reason = "live_watch_active"
+                    else:
+                        d["live_struct_d"] = f"{b_stage}_NO_MORE_VALID"
+                        attempt_status = "invalidated"
+                        attempt_reason = "fell_below_ema9"
+                        attempt_invalidated_at = now_iso
                 else:
-                    d["live_struct_d"] = f"{b_stage}_NO_MORE_VALID"
+                    d["live_struct_d"] = "B_LIVE_WATCH" if price >= ema9 else "B_NO_MORE_VALID"
+                if price < ema9 and attempt_tag:
                     attempt_status = "invalidated"
                     attempt_reason = "fell_below_ema9"
                     attempt_invalidated_at = now_iso
-            else:
-                d["live_struct_d"] = "B_LIVE_WATCH" if price >= ema9 else "B_NO_MORE_VALID"
-            if price < ema9 and attempt_tag:
-                attempt_status = "invalidated"
-                attempt_reason = "fell_below_ema9"
-                attempt_invalidated_at = now_iso
-        elif tag.startswith("E"):
-            if e_stage and attempt_tag != e_stage:
-                attempt_tag = e_stage
-                attempt_started_at = now_iso
-                attempt_invalidated_at = ""
-                attempt_status = "valid"
-                attempt_reason = "e_live_watch_started"
-            if e_stage:
-                if price >= ema9:
-                    d["live_struct_d"] = f"{e_stage}_LIVE_WATCH"
+            elif tag.startswith("E"):
+                if e_stage and attempt_tag != e_stage:
+                    attempt_tag = e_stage
+                    attempt_started_at = now_iso
+                    attempt_invalidated_at = ""
                     attempt_status = "valid"
-                    attempt_reason = "e_live_watch_active"
+                    attempt_reason = "e_live_watch_started"
+                if e_stage:
+                    if price >= ema9:
+                        d["live_struct_d"] = f"{e_stage}_LIVE_WATCH"
+                        attempt_status = "valid"
+                        attempt_reason = "e_live_watch_active"
+                    else:
+                        d["live_struct_d"] = f"{e_stage}_NO_MORE_VALID"
+                        attempt_status = "invalidated"
+                        attempt_reason = "e_fell_below_ema9"
+                        attempt_invalidated_at = now_iso
                 else:
-                    d["live_struct_d"] = f"{e_stage}_NO_MORE_VALID"
+                    d["live_struct_d"] = f"{tag}_LIVE"
+            elif tag == "RST":
+                d["live_struct_d"] = "RST_LIVE"
+                if attempt_tag and attempt_status.lower() == "valid":
                     attempt_status = "invalidated"
-                    attempt_reason = "e_fell_below_ema9"
+                    attempt_reason = "shifted_to_RST"
                     attempt_invalidated_at = now_iso
-            else:
-                d["live_struct_d"] = f"{tag}_LIVE"
-        elif tag == "RST":
-            d["live_struct_d"] = "RST_LIVE"
-            if attempt_tag and attempt_status.lower() == "valid":
-                attempt_status = "invalidated"
-                attempt_reason = "shifted_to_RST"
-                attempt_invalidated_at = now_iso
+
+            # If we produced an intraday state, latch it for the day.
+            produced = _state_text(d.get("live_struct_d", ""))
+            if produced and not _state_text(d.get("lsd_latch", "")):
+                d["lsd_latch"] = produced
+                d["lsd_day_status"] = "latched"
 
     live = _state_text(d.get("live_struct_d", ""))
 
@@ -224,5 +452,7 @@ def compute_live_struct_d(
         "live_attempt_status": attempt_status,
         "live_attempt_reason": attempt_reason,
     }
+    if reconcile_symptom is not None:
+        meta["reconcile_symptom"] = reconcile_symptom
     return (live, meta)
 

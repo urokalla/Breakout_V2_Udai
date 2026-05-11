@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, List
@@ -18,6 +19,7 @@ class HistoryAdapter:
     pipeline_data_dir: str
     _symbol_file_index: dict[str, Path] | None = None
     _rows_cache: dict[tuple[str, int], tuple[float, list[dict]]] | None = None
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @staticmethod
     def _cache_ttl_sec() -> float:
@@ -66,12 +68,13 @@ class HistoryAdapter:
 
     def _read_parquet_rows(self, symbol: str, limit: int) -> list[dict]:
         key = (str(symbol or "").upper(), int(limit))
-        if self._rows_cache is not None:
-            hit = self._rows_cache.get(key)
-            if hit is not None:
-                ts_cached, rows_cached = hit
-                if (time.time() - float(ts_cached)) <= self._cache_ttl_sec():
-                    return list(rows_cached)
+        with self._cache_lock:
+            if self._rows_cache is not None:
+                hit = self._rows_cache.get(key)
+                if hit is not None:
+                    ts_cached, rows_cached = hit
+                    if (time.time() - float(ts_cached)) <= self._cache_ttl_sec():
+                        return list(rows_cached)
 
         parquet_path = self._resolve_symbol_path(symbol)
         if parquet_path is None or not parquet_path.exists():
@@ -84,9 +87,10 @@ class HistoryAdapter:
                 return []
             df = df.tail(limit)
             rows = df.to_dict("records")
-            if self._rows_cache is None:
-                self._rows_cache = {}
-            self._rows_cache[key] = (time.time(), rows)
+            with self._cache_lock:
+                if self._rows_cache is None:
+                    self._rows_cache = {}
+                self._rows_cache[key] = (time.time(), rows)
             return rows
         except Exception:
             return []

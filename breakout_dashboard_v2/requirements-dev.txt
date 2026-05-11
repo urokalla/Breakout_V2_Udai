@@ -1,0 +1,3 @@
+# CI / local dev (not required for prod runtime)
+-r requirements.txt
+pytest>=8.0

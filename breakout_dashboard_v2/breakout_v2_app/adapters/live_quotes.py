@@ -25,9 +25,9 @@ class LiveQuoteAdapter:
 
     @staticmethod
     def _live_source_mode() -> str:
-        # Default remains SHM for zero-behavior-change rollout.
-        mode = os.getenv("BREAKOUT_V2_LIVE_SOURCE", os.getenv("LIVE_SOURCE", "shm")).strip().lower()
-        return mode if mode in ("shm", "dragonfly") else "shm"
+        # Force Dragonfly as the live source mode.
+        mode = os.getenv("BREAKOUT_V2_LIVE_SOURCE", os.getenv("LIVE_SOURCE", "dragonfly")).strip().lower()
+        return "dragonfly" if mode != "dragonfly" else mode
 
     @staticmethod
     def _db_symbol_candidates(sym: str) -> list[str]:
@@ -292,19 +292,8 @@ class LiveQuoteAdapter:
             dragonfly_quotes = self._fetch_from_dragonfly(symbols)
             if dragonfly_quotes:
                 return dragonfly_quotes
-            # Safe fallback during validation/incident rollback.
-            if self._shm_enabled():
-                shm_quotes = self._fetch_from_shm(symbols)
-                if shm_quotes:
-                    return shm_quotes
 
-        # Scanner SHM is primary live-tick source (parity with main dashboard).
-        if self._shm_enabled():
-            shm_quotes = self._fetch_from_shm(symbols)
-            if shm_quotes:
-                return shm_quotes
-
-        # Fallbacks when SHM path is unavailable.
+        # Non-SHM fallbacks when Dragonfly data is unavailable.
         db_quotes = self._fetch_from_db(symbols)
         if db_quotes:
             return db_quotes

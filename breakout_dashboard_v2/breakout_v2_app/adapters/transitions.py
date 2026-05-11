@@ -46,6 +46,7 @@ class TransitionStoreAdapter:
             "live_attempt_invalidated_at",
             "live_attempt_status",
             "live_attempt_reason",
+            "reconcile_symptom",
         }
         return {k: v for k, v in meta.items() if k not in drop_keys}
 
