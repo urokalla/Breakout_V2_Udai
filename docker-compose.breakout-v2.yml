@@ -12,37 +12,8 @@ services:
     networks:
       - sovereign_net
 
-  shm_dragonfly_bridge:
-    build:
-      context: ..
-      dockerfile: breakout_dashboard_v2_repo/breakout_dashboard_v2/Dockerfile
-    container_name: sovereign_shm_dragonfly_bridge
-    restart: unless-stopped
-    env_file:
-      - ../RS_PROJECT/stock_scanner_sovereign/.env
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app/stock_scanner_sovereign/frontend_reflex:/app/stock_scanner_sovereign:/app/breakout_dashboard_v2
-      - DRAGONFLY_HOST=dragonfly
-      - DRAGONFLY_PORT=6379
-      - DRAGONFLY_KEY_PREFIX=live
-      - DRAGONFLY_HEARTBEAT_KEY=live:heartbeat
-      - SHM_MMAP_PATH=/app/stock_scanner_sovereign/scanner_results.mmap
-      - SHM_INDEX_MAP_PATH=/app/stock_scanner_sovereign/symbols_idx_map.json
-      - SHM_BRIDGE_POLL_SEC=0.5
-      - SHM_BRIDGE_BATCH_SIZE=500
-      - SHM_BRIDGE_MAX_ROWS=10000
-    volumes:
-      - ../RS_PROJECT/stock_scanner_sovereign:/app/stock_scanner_sovereign:ro
-      - ./breakout_dashboard_v2:/app/breakout_dashboard_v2
-    working_dir: /app/breakout_dashboard_v2
-    command: ["python", "/app/breakout_dashboard_v2/scripts/shm_to_dragonfly_bridge.py"]
-    depends_on:
-      - dragonfly
-    cpus: ${BREAKOUT_V2_BRIDGE_CPUS:-0.25}
-    mem_limit: ${BREAKOUT_V2_BRIDGE_MEM_LIMIT:-384m}
-    networks:
-      - sovereign_net
+  # Optional elsewhere: SHM→Dragonfly bridge if the scanner only writes mmap but V2 reads `live:*` in Dragonfly.
+  # Default live bus: BREAKOUT_V2_LIVE_SOURCE=dragonfly (see live_quotes._live_source_mode; ignores shared LIVE_SOURCE).
 
   dashboard_breakout_v2:
     build:
@@ -64,12 +35,20 @@ services:
       - BREAKOUT_V2_STORAGE_DATA_ROOT=/app/stock_scanner_sovereign/data
       - BREAKOUT_V2_SCANNER_API_URL=${BREAKOUT_V2_SCANNER_API_URL:-}
       - BREAKOUT_V2_ENABLE_SHM=${BREAKOUT_V2_ENABLE_SHM:-1}
-      - BREAKOUT_V2_LIVE_SOURCE=${BREAKOUT_V2_LIVE_SOURCE:-shm}
+      # 1 = NumPy fastpath for daily ref + pct/chp and weekly pct/chp (see engine._vector_fastpath_*).
+      - BREAKOUT_V2_VECTOR_FASTPATH=${BREAKOUT_V2_VECTOR_FASTPATH:-0}
+      - BREAKOUT_V2_LIVE_SOURCE=${BREAKOUT_V2_LIVE_SOURCE:-dragonfly}
       - BREAKOUT_V2_DATA_MODE=${BREAKOUT_V2_DATA_MODE:-storage_only}
-      - DASHBOARD_POLL_INTERVAL_SEC=${BREAKOUT_V2_DASHBOARD_POLL_INTERVAL_SEC:-1}
+      - DASHBOARD_POLL_INTERVAL_SEC=${BREAKOUT_V2_DASHBOARD_POLL_INTERVAL_SEC:-2}
+      # Parquet row cache TTL (seconds); higher = more RAM, fewer decode passes between polls.
+      - BREAKOUT_V2_HISTORY_CACHE_SEC=${BREAKOUT_V2_HISTORY_CACHE_SEC:-300}
+      # When outside Mon–Fri ~9:15–15:30 IST cash session, poll at least this many seconds (saves 1 CPU).
+      - BREAKOUT_V2_POLL_SEC_OFFHOURS=${BREAKOUT_V2_POLL_SEC_OFFHOURS:-90}
       - BREAKOUT_V2_DEBUG_TIMING=${BREAKOUT_V2_DEBUG_TIMING:-0}
       # Optional only: reuse snapshot up to N sec (can show slightly stale rows). Default 0 = always full recompute.
       - BREAKOUT_V2_SNAPSHOT_CACHE_SEC=${BREAKOUT_V2_SNAPSHOT_CACHE_SEC:-0}
+      # Under a single CPU, very high worker counts mostly add contention; 8–12 is a sane default.
+      - BREAKOUT_V2_SNAPSHOT_WORKERS=${BREAKOUT_V2_SNAPSHOT_WORKERS:-10}
       - DASHBOARD_BREAKOUT_LOOP=0
     volumes:
       - ../RS_PROJECT/stock_scanner_sovereign:/app/stock_scanner_sovereign:ro
@@ -80,13 +59,14 @@ services:
     ports:
       - "3002:3000"
       - "8002:8000"
-    cpus: ${BREAKOUT_V2_DASHBOARD_CPUS:-1.0}
-    mem_limit: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-1024m}
+    # Fixed 1 CPU for this container (avoid compose env accidentally raising it).
+    cpus: "1.0"
+    mem_limit: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-2048m}
     deploy:
       resources:
         limits:
-          cpus: ${BREAKOUT_V2_DASHBOARD_CPUS:-1.0}
-          memory: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-1024m}
+          cpus: "1.0"
+          memory: ${BREAKOUT_V2_DASHBOARD_MEM_LIMIT:-2048m}
     networks:
       - sovereign_net
 

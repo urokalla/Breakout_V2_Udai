@@ -71,6 +71,75 @@ class V2Engine:
         return (last_close > ref, float(last_close), float(ref))
 
     @staticmethod
+    def _vector_fastpath_enabled() -> bool:
+        return str(os.getenv("BREAKOUT_V2_VECTOR_FASTPATH", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    @staticmethod
+    def _vector_fastpath_daily_numeric(
+        closes: list[float], last_live: float
+    ) -> tuple[float, float, float, float, float] | None:
+        """
+        Optional NumPy path for ref / pct_live / chp (matches _build_daily_row_from_ohlcv).
+        Returns None if disabled or imports fail.
+        """
+        if not V2Engine._vector_fastpath_enabled():
+            return None
+        try:
+            import numpy as np
+            from experiments.vector_breakout.core import (
+                chp_vs_prev_close,
+                live_pct_vs_ref,
+                reference_levels_donchian_10_excl_last,
+            )
+        except Exception:
+            return None
+        arr = np.asarray(closes, dtype=np.float64).ravel()
+        if arr.size == 0:
+            return None
+        ref = float(reference_levels_donchian_10_excl_last(arr.reshape(1, -1))[0])
+        if not np.isfinite(ref):
+            ref = float(arr[-1]) if arr.size else 0.0
+        last_close = float(arr[-1])
+        prev = float(arr[-2]) if arr.size >= 2 else float(arr[-1])
+        chp_r = chp_vs_prev_close(
+            np.array([last_live], dtype=np.float64),
+            np.array([prev], dtype=np.float64),
+        )[0]
+        pct_r = live_pct_vs_ref(
+            np.array([last_live], dtype=np.float64),
+            np.array([ref], dtype=np.float64),
+        )[0]
+        chp = 0.0 if not np.isfinite(chp_r) else float(chp_r)
+        pct_live = 0.0 if not np.isfinite(pct_r) else float(pct_r)
+        return (last_close, ref, prev, chp, pct_live)
+
+    @staticmethod
+    def _vector_fastpath_pct_chp(last_live: float, prev: float, ref: float) -> tuple[float, float] | None:
+        """Vectorized pct_live vs ref and chp vs prev; same fallbacks as scalar engine when ref/prev falsy."""
+        if not V2Engine._vector_fastpath_enabled():
+            return None
+        try:
+            import numpy as np
+            from experiments.vector_breakout.core import chp_vs_prev_close, live_pct_vs_ref
+        except Exception:
+            return None
+        chp_r = chp_vs_prev_close(
+            np.array([last_live], dtype=np.float64),
+            np.array([float(prev)], dtype=np.float64),
+        )[0]
+        pct_r = live_pct_vs_ref(
+            np.array([last_live], dtype=np.float64),
+            np.array([float(ref)], dtype=np.float64),
+        )[0]
+        chp = 0.0 if not np.isfinite(chp_r) else float(chp_r)
+        pct_live = 0.0 if not np.isfinite(pct_r) else float(pct_r)
+        return (pct_live, chp)
+
+    @staticmethod
     def _norm_symbol(sym: str) -> str:
         s = str(sym or "").strip().upper()
         if s.startswith("NSE:"):
@@ -111,9 +180,9 @@ class V2Engine:
     @staticmethod
     def _snapshot_max_workers() -> int:
         try:
-            return max(2, min(int(os.getenv("BREAKOUT_V2_SNAPSHOT_WORKERS", "8")), 24))
+            return max(2, min(int(os.getenv("BREAKOUT_V2_SNAPSHOT_WORKERS", "10")), 24))
         except Exception:
-            return 8
+            return 10
 
     @staticmethod
     def _snapshot_phase_debug_enabled() -> bool:
@@ -134,17 +203,23 @@ class V2Engine:
         closes = [x["close"] for x in ohlcv[-120:] if "close" in x]
         if not closes:
             return None
-        last_close = float(closes[-1])
-        ref = float(max(closes[-11:-1])) if len(closes) >= 11 else float(closes[-1])
         q = quote_map.get(sym) or {}
         q_ltp = q.get("ltp")
         try:
-            last_live = float(q_ltp) if q_ltp is not None else float(last_close)
+            last_close0 = float(closes[-1])
+            last_live = float(q_ltp) if q_ltp is not None else last_close0
         except Exception:
-            last_live = float(last_close)
-        prev = closes[-2] if len(closes) > 1 else closes[-1]
-        chp = ((last_live / prev) - 1.0) * 100.0 if prev else 0.0
-        pct_live = ((last_live / ref) - 1.0) * 100.0 if ref else 0.0
+            last_close0 = float(closes[-1])
+            last_live = last_close0
+        vn = self._vector_fastpath_daily_numeric(closes, last_live)
+        if vn is not None:
+            last_close, ref, _prev_v, chp, pct_live = vn
+        else:
+            last_close = float(closes[-1])
+            ref = float(max(closes[-11:-1])) if len(closes) >= 11 else float(closes[-1])
+            prev = closes[-2] if len(closes) > 1 else closes[-1]
+            chp = ((last_live / prev) - 1.0) * 100.0 if prev else 0.0
+            pct_live = ((last_live / ref) - 1.0) * 100.0 if ref else 0.0
         when_d = str(ohlcv[-1].get("ts", "—"))
         structural_event_key = self._daily_eod_event_key_from_ohlcv(ohlcv)
         tag = "—"
@@ -154,6 +229,7 @@ class V2Engine:
             when_d = s_when
         if s_event_key not in ("", "-"):
             structural_event_key = s_event_key
+
         is_breakout = str(tag).upper().startswith("B")
         overlay = timing_daily.get(sym, {})
         if overlay:
@@ -205,8 +281,11 @@ class V2Engine:
             "last_tag_is_today_event": bool(str(when_d)[:10] == str(structural_event_key)),
             "brk_move_live_pct": round(pct_live, 2),
             "live_struct_d": live_struct_d,
-            "live_struct_track_day": str((state_meta or {}).get("live_attempt_started_at", "") or "")[:10],
+            "live_struct_attempt_started_day": (
+                str((state_meta or {}).get("live_attempt_started_at", "") or "").strip()[:10]
+            ),
             "live_struct_attempt_status": str((state_meta or {}).get("live_attempt_status", "") or ""),
+            "live_struct_attempt_reason": str((state_meta or {}).get("live_attempt_reason", "") or ""),
             "chp": round(chp, 2),
             "rs_rating": int(q.get("rs_rating") or 0),
             "mrs": float(q.get("mrs") or 0.0),
@@ -380,8 +459,12 @@ class V2Engine:
         except Exception:
             last_live = float(last_close)
         prev = weekly[-2] if len(weekly) > 1 else weekly[-1]
-        chp = ((last_live / prev) - 1.0) * 100.0 if prev else 0.0
-        pct_live = ((last_live / ref) - 1.0) * 100.0 if ref else 0.0
+        vw = self._vector_fastpath_pct_chp(last_live, float(prev), float(ref))
+        if vw is not None:
+            pct_live, chp = vw
+        else:
+            chp = ((last_live / prev) - 1.0) * 100.0 if prev else 0.0
+            pct_live = ((last_live / ref) - 1.0) * 100.0 if ref else 0.0
         when_w = weekly_ts[-1] if weekly_ts else "—"
         tag = "B" if brk12 else "E21C"
         overlay = timing_weekly.get(sym, {})

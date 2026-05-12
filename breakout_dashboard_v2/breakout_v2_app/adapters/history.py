@@ -24,9 +24,10 @@ class HistoryAdapter:
     @staticmethod
     def _cache_ttl_sec() -> float:
         try:
-            return max(1.0, float(os.getenv("BREAKOUT_V2_HISTORY_CACHE_SEC", "20")))
+            # Longer default trades RAM for fewer repeated parquet decodes (same symbol+limit key).
+            return max(1.0, float(os.getenv("BREAKOUT_V2_HISTORY_CACHE_SEC", "120")))
         except Exception:
-            return 20.0
+            return 120.0
 
     @staticmethod
     def _norm_symbol(s: str) -> str:

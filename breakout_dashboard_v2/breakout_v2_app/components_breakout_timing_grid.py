@@ -50,7 +50,6 @@ def breakout_timing_daily_data_grid():
         ),
         rx.table.column_header_cell(rx.text("PATH", color="#B0BEC5", font_size="9px")),
         rx.table.column_header_cell(rx.text("LIVE_STRUCT_D", color="white", font_size="11px")),
-        rx.table.column_header_cell(rx.text("LIVE_TRACK_DAY", color="#B0BEC5", font_size="10px")),
         rx.table.column_header_cell(rx.text("LIVE_STATUS", color="#B0BEC5", font_size="10px")),
         rx.table.column_header_cell(
             rx.hstack(rx.text("WHEN (D) IST", color="white"), rx.text(S.when_d_sort_arrow, color="#00E5FF", font_size="10px"), spacing="1", cursor="pointer", on_click=S.toggle_sort_when_d)
@@ -140,7 +139,6 @@ def breakout_timing_daily_data_grid():
                     ),
                     padding_y="0",
                 ),
-                rx.table.cell(rx.text(r.get("live_struct_track_day", "—"), color="#90A4AE", font_size="10px"), padding_y="0"),
                 rx.table.cell(rx.text(r.get("live_struct_attempt_status", "—"), color="#90A4AE", font_size="10px"), padding_y="0"),
                 rx.table.cell(rx.text(r.get("last_event_dt", "—"), color="#E0E0E0", font_size="10px"), padding_y="0"),
                 rx.table.cell(rx.text(r.get("brk_move_live_pct", "—"), color=r.get("brk_move_live_color", "#666666"), font_size="10px"), padding_y="0"),

@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import reflex as rx
@@ -33,13 +34,24 @@ class V2State(rx.State):
         self.search_query = (q or "").strip().upper()
         self.current_page = 1
 
-    def set_universe(self, u: str):
-        self.universe = (u or "Nifty 50").strip()
+    async def set_universe(self, u: str):
+        u_clean = (u or "Nifty 50").strip()
+        self.universe = u_clean
         self.current_page = 1
-        self._reload_snapshot()
+        self.daily_rows = []
+        self.weekly_rows = []
+        self.strategy_rows = []
+        self.symbol_count = 0
+        self.status = "LOADING"
+        yield
+        snap = await asyncio.to_thread(lambda: get_engine().snapshot(universe=u_clean))
+        self._apply_snapshot(snap)
 
     def _reload_snapshot(self):
         snap = get_engine().snapshot(universe=self.universe)
+        self._apply_snapshot(snap)
+
+    def _apply_snapshot(self, snap: dict) -> None:
         self.symbol_count = int(snap.get("symbol_count", 0))
         self.daily_rows = list(snap.get("daily_rows", []))
         self.weekly_rows = list(snap.get("weekly_rows", []))

@@ -59,9 +59,94 @@ def _live_token_from_live_struct(s: str) -> str:
         return t[: -len("_LIVE_WATCH")].strip()
     if t.endswith("_NO_MORE_VALID"):
         return t[: -len("_NO_MORE_VALID")].strip()
+    if t.endswith("_TIC_WATCH"):
+        return t[: -len("_TIC_WATCH")].strip()
+    if "_CONFIRMED(" in t:
+        return t.split("_CONFIRMED", 1)[0].strip()
+    if t.endswith("_CONFIRMED"):
+        return t[: -len("_CONFIRMED")].strip()
+    if t.endswith("_LIVE_FAILED"):
+        return t[: -len("_LIVE_FAILED")].strip()
     if t == "RST_LIVE":
         return "RST"
     return ""
+
+
+def _live_track_redundant_with_last_tag(candidate: str, structural_last_tag_d: str) -> bool:
+    """True if LIVE_TRACK would repeat LAST TAG D (same plain token or same B-base on a compound row)."""
+    c = _state_text(candidate).strip().upper()
+    lt = _state_text(structural_last_tag_d).strip().upper()
+    if not c or not lt or lt == "—":
+        return False
+    if c == lt:
+        return True
+    if "+" not in lt:
+        return c == lt
+    base = lt.split("+", 1)[0].strip().upper()
+    return c == base
+
+
+def _infer_live_track_focus(
+    structural_tag: str,
+    live_struct_d: str,
+    ltp: float,
+    ema9: float,
+    ema21: float,
+) -> str:
+    """
+    When LIVE_STRUCT says ``Bn_NO_MORE_VALID`` (live ticks: not sustaining B vs EMA9), LIVE_TRACK should
+    point at **what tape can do next** — E9CT / E21 arms — not repeat ``Bn`` (same idea as LAST TAG D).
+
+    Uses live LTP vs EMA9/EMA21 from the same OHLC the ladder uses in this function.
+    """
+    t = _state_text(structural_tag).strip().upper()
+    ls = _state_text(live_struct_d).strip().upper()
+    if not t.startswith("B") or "_NO_MORE_VALID" not in ls:
+        return ""
+    try:
+        px = float(ltp or 0.0)
+        e9 = float(ema9 or 0.0)
+        e21 = float(ema21 or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if px <= 0.0 or e9 <= 0.0:
+        return ""
+    if px >= e9:
+        return ""
+    # Below EMA9: watch next structural lanes (counts fixed to *1 until cycle counts are plumbed in).
+    if e21 > 0.0 and px < e21:
+        return "E21C1"
+    return "E9CT1"
+
+
+def live_track_tag_for_ui(
+    live_attempt_tag: str,
+    live_struct_d: str,
+    structural_last_tag_d: str,
+) -> str:
+    """
+    LIVE_TRACK = intraday tag token from the live ledger — **never** the same visible token as LAST TAG D
+    (``B6`` vs ``B6`` shows blank here; ``B2+E9CT`` still allows ``E9CT1`` on this column).
+    """
+    lt_full = _state_text(structural_last_tag_d).strip().upper()
+
+    att = _state_text(live_attempt_tag).upper()
+    if att and not _live_track_redundant_with_last_tag(att, structural_last_tag_d):
+        return att
+
+    tok = _live_token_from_live_struct(_state_text(live_struct_d))
+    if tok:
+        u = tok.upper()
+        if not _live_track_redundant_with_last_tag(u, structural_last_tag_d):
+            return u
+
+    if "+" in lt_full:
+        rest = lt_full.split("+", 1)[1].strip().upper()
+        if rest and not _live_track_redundant_with_last_tag(rest, structural_last_tag_d):
+            return rest
+
+    return ""
+
 
 def _attempt_is_for_prev_evk(attempt_started_at: str, prev_evk: str) -> bool:
     """
@@ -432,10 +517,19 @@ def compute_live_struct_d(
 
     live = _state_text(d.get("live_struct_d", ""))
 
+    try:
+        _ltp_f = float(ltp or 0.0)
+        _e9_f = float(d.get("ema9_d", 0.0) or 0.0)
+        _e21_f = float(d.get("ema21_d", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        _ltp_f, _e9_f, _e21_f = 0.0, 0.0, 0.0
+    live_track_focus = _infer_live_track_focus(tag, live, _ltp_f, _e9_f, _e21_f)
+
     meta = {
         "last_tag_d_structural": tag,
         "structural_event_key": evk,
         "live_struct_d": live,
+        "live_track_focus": live_track_focus,
         "lsd_latch": d.get("lsd_latch", ""),
         "lsd_ist_day": d.get("lsd_ist_day", ""),
         "lsd_ge9": int(d.get("lsd_ge9", 0) or 0),

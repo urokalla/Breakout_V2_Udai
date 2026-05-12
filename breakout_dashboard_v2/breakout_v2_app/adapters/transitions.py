@@ -36,16 +36,13 @@ class TransitionStoreAdapter:
     @staticmethod
     def _state_meta_for_db(meta: dict | None) -> dict:
         """
-        Keep DB state_meta minimal: do not persist session-only live attempt tracking.
+        Persist durable live-attempt fields so LIVE_TRACK_DAY / LIVE_STATUS survive polls.
+
+        Still omit reconcile_symptom (debug-only, can be large).
         """
         if not isinstance(meta, dict):
             return {}
         drop_keys = {
-            "live_attempt_tag",
-            "live_attempt_started_at",
-            "live_attempt_invalidated_at",
-            "live_attempt_status",
-            "live_attempt_reason",
             "reconcile_symptom",
         }
         return {k: v for k, v in meta.items() if k not in drop_keys}

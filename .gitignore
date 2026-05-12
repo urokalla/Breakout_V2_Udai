@@ -2,6 +2,7 @@
 *.pyc
 __pycache__/
 .venv/
+.venv_vec*/
 venv/
 *.log
 runtime/*.log

@@ -25,9 +25,25 @@ class LiveQuoteAdapter:
 
     @staticmethod
     def _live_source_mode() -> str:
-        # Force Dragonfly as the live source mode.
-        mode = os.getenv("BREAKOUT_V2_LIVE_SOURCE", os.getenv("LIVE_SOURCE", "dragonfly")).strip().lower()
-        return "dragonfly" if mode != "dragonfly" else mode
+        # V2 live bus: ONLY this key (default dragonfly). Do not read `LIVE_SOURCE` / sovereign `.env`
+        # — those often set `shm` for the master scanner and would silently force mmap quotes + SHM badges here.
+        raw = str(os.getenv("BREAKOUT_V2_LIVE_SOURCE") or "dragonfly").strip().lower()
+        if raw == "shm":
+            return "shm"
+        return "dragonfly"
+
+    @staticmethod
+    def _coerce_api_quote_sources(quotes: Dict[str, dict]) -> Dict[str, dict]:
+        """HTTP scanner payloads sometimes echo `source=scanner_shm`; V2 did not read mmap for those rows."""
+        out: Dict[str, dict] = {}
+        for k, v in quotes.items():
+            if not isinstance(v, dict):
+                continue
+            row = dict(v)
+            if str(row.get("source") or "").strip().lower() == "scanner_shm":
+                row["source"] = "scanner_api"
+            out[str(k).upper()] = row
+        return out
 
     @staticmethod
     def _db_symbol_candidates(sym: str) -> list[str]:
@@ -233,7 +249,7 @@ class LiveQuoteAdapter:
             for key in ("quotes", "data", "result"):
                 node = payload.get(key)
                 if isinstance(node, dict):
-                    return {str(k).upper(): v for k, v in node.items()}
+                    return self._coerce_api_quote_sources({str(k).upper(): v for k, v in node.items()})
                 if isinstance(node, list):
                     out: Dict[str, dict] = {}
                     for item in node:
@@ -242,7 +258,7 @@ class LiveQuoteAdapter:
                         sym = str(item.get("symbol", "")).strip().upper()
                         if sym:
                             out[sym] = item
-                    return out
+                    return self._coerce_api_quote_sources(out)
         return {}
 
     def _fetch_from_dragonfly(self, symbols: list[str]) -> Dict[str, dict]:
@@ -292,6 +308,13 @@ class LiveQuoteAdapter:
             dragonfly_quotes = self._fetch_from_dragonfly(symbols)
             if dragonfly_quotes:
                 return dragonfly_quotes
+        elif source_mode == "shm" and self._shm_enabled():
+            shm_q = self._fetch_from_shm(symbols)
+            if shm_q:
+                return shm_q
+            dragonfly_q = self._fetch_from_dragonfly(symbols)
+            if dragonfly_q:
+                return dragonfly_q
 
         # Non-SHM fallbacks when Dragonfly data is unavailable.
         db_quotes = self._fetch_from_db(symbols)

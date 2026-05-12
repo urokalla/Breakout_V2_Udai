@@ -8,6 +8,21 @@ from datetime import datetime, timezone
 from .engine import get_engine
 
 
+def _nse_cash_session_ist_open() -> bool:
+    """Rough NSE cash session Mon–Fri Asia/Kolkata 09:15–15:30. Used to slow polling off-hours."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+    except Exception:
+        return True
+    now = datetime.now(ist)
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return (9 * 60 + 15) <= m < (15 * 60 + 31)
+
+
 class BreakoutClockState(rx.State):
     clock_timeframe: str = "daily"
     universe: str = "Nifty 50"
@@ -52,6 +67,8 @@ class BreakoutClockState(rx.State):
     structural_today_et9: int = 0
     structural_today_e21c: int = 0
     structural_today_rst: int = 0
+    # Daily POST EOD chips: ALL | TODAY | B | E9CT | ET9 | E21C | RST (intersects with other filters).
+    structural_today_bucket: str = "ALL"
     _sorted_symbol_cache_key: str = ""
     _sorted_symbols: list[str] = []
 
@@ -129,6 +146,13 @@ class BreakoutClockState(rx.State):
                 poll_sec = max(poll_sec, 5.0)
             elif n >= 200:
                 poll_sec = max(poll_sec, 3.0)
+            # Outside NSE cash hours parquet/quotes barely move — avoid 1s snapshot loops burning 1 CPU.
+            if not _nse_cash_session_ist_open():
+                try:
+                    off_floor = float(os.getenv("BREAKOUT_V2_POLL_SEC_OFFHOURS", "60"))
+                except Exception:
+                    off_floor = 60.0
+                poll_sec = max(poll_sec, max(off_floor, float(base_poll_sec)))
             await asyncio.sleep(poll_sec)
             async with self:
                 self.poll_heartbeat += 1
@@ -178,12 +202,52 @@ class BreakoutClockState(rx.State):
             out = [r for r in out if bool(r.get("is_breakout")) or float(r.get("chp", 0.0)) >= 0]
         if (self.filter_wmrs_slope or "ALL").strip().upper() == "POS":
             out = [r for r in out if float(r.get("chp", 0.0)) >= 0]
+
+        # POST EOD structural-today chips (daily only; matches sidebar counter logic).
+        if self.clock_timeframe == "daily":
+            bstk = (self.structural_today_bucket or "ALL").strip().upper()
+            lt_key = "last_tag"
+            if bstk == "TODAY":
+                out = [r for r in out if bool(r.get("last_tag_is_today_event"))]
+            elif bstk == "B":
+                out = [
+                    r
+                    for r in out
+                    if bool(r.get("last_tag_is_today_event"))
+                    and str(r.get(lt_key, "") or "").strip().upper().startswith("B")
+                ]
+            elif bstk == "E9CT":
+                out = [
+                    r
+                    for r in out
+                    if bool(r.get("last_tag_is_today_event"))
+                    and str(r.get(lt_key, "") or "").strip().upper().startswith("E9CT")
+                ]
+            elif bstk == "ET9":
+                out = [
+                    r
+                    for r in out
+                    if bool(r.get("last_tag_is_today_event"))
+                    and str(r.get(lt_key, "") or "").strip().upper() == "ET9DNWF21C"
+                ]
+            elif bstk == "E21C":
+                out = [
+                    r
+                    for r in out
+                    if bool(r.get("last_tag_is_today_event"))
+                    and str(r.get(lt_key, "") or "").strip().upper().startswith("E21C")
+                ]
+            elif bstk == "RST":
+                out = [
+                    r
+                    for r in out
+                    if bool(r.get("last_tag_is_today_event"))
+                    and str(r.get(lt_key, "") or "").strip().upper() == "RST"
+                ]
         return out
 
-    def _reload(self):
-        t0 = time.perf_counter()
-        snap = get_engine().snapshot(universe=self.universe)
-        t1 = time.perf_counter()
+    def _hydrate_from_snapshot(self, snap: dict, t0: float, t1: float) -> None:
+        """Apply engine snapshot to UI fields (used by _reload and async universe switch)."""
         if self._debug_enabled():
             phases = snap.get("_debug_snapshot_phases_ms") if isinstance(snap, dict) else None
             if isinstance(phases, dict) and phases:
@@ -226,6 +290,7 @@ class BreakoutClockState(rx.State):
                 str(self.filter_wmrs_slope),
                 str(self.filter_m_rsi2),
                 str(self.filter_profile),
+                str(self.structural_today_bucket),
                 q,
                 str(key),
                 "desc" if self.sort_timing_desc else "asc",
@@ -302,6 +367,12 @@ class BreakoutClockState(rx.State):
                 f"gc={gc_counts}"
             )
 
+    def _reload(self):
+        t0 = time.perf_counter()
+        snap = get_engine().snapshot(universe=self.universe)
+        t1 = time.perf_counter()
+        self._hydrate_from_snapshot(snap, t0, t1)
+
     @staticmethod
     def _format_row(r: dict) -> dict:
         sym = r.get("symbol", "")
@@ -314,8 +385,14 @@ class BreakoutClockState(rx.State):
         tag_w = str(r.get("last_tag_w", tag_d))
         tag_today_event = bool(r.get("last_tag_is_today_event"))
         live_struct_d_raw = str(r.get("live_struct_d", "")).strip()
-        live_struct_track_day = str(r.get("live_struct_track_day", "")).strip() or "—"
-        live_struct_attempt_status = str(r.get("live_struct_attempt_status", "")).strip() or "—"
+        _st = str(r.get("live_struct_attempt_status", "")).strip()
+        _rs = str(r.get("live_struct_attempt_reason", "")).strip()
+        if _st and _rs:
+            live_struct_attempt_status = f"{_st} · {_rs}"
+        elif _st:
+            live_struct_attempt_status = _st
+        else:
+            live_struct_attempt_status = "—"
         live_struct_w_raw = str(r.get("live_struct_w", "")).strip()
         live_struct_d = live_struct_d_raw if live_struct_d_raw else "—"
         live_struct_w = live_struct_w_raw if live_struct_w_raw else "—"
@@ -371,7 +448,6 @@ class BreakoutClockState(rx.State):
             "live_struct_d": live_struct_d,
             "live_struct_d_color": "#FF5252" if BreakoutClockState._is_live_struct_mismatch(tag_d, live_struct_d_raw) else ("#00E5FF" if is_breakout else "#777777"),
             "live_struct_mismatch": BreakoutClockState._is_live_struct_mismatch(tag_d, live_struct_d_raw),
-            "live_struct_track_day": live_struct_track_day,
             "live_struct_attempt_status": live_struct_attempt_status,
             "last_event_dt": r.get("last_event_dt", "—"),
             "brk_move_live_pct": pct_d_text,
@@ -391,10 +467,41 @@ class BreakoutClockState(rx.State):
             return
         self.expanded_path_symbol = "" if self.expanded_path_symbol == s else s
 
-    def set_universe(self, u: str):
-        self.universe = u
+    def set_structural_today_bucket(self, bucket: str):
+        b = (bucket or "ALL").strip().upper()
+        allowed = {"ALL", "TODAY", "B", "E9CT", "ET9", "E21C", "RST"}
+        self.structural_today_bucket = b if b in allowed else "ALL"
         self.current_page = 1
+        self._sorted_symbol_cache_key = ""
+        self._sorted_symbols = []
         self._reload()
+
+    async def set_universe(self, u: str):
+        """Update universe in UI immediately; load snapshot in a worker thread (no multi-second block on click)."""
+        u_clean = (u or "Nifty 50").strip()
+        self.universe = u_clean
+        self.current_page = 1
+        self._sorted_symbol_cache_key = ""
+        self._sorted_symbols = []
+        self.results = []
+        self.total_count = 0
+        self.symbol_count_total = 0
+        self.symbol_count_loaded = 0
+        self.structural_today_count = 0
+        self.structural_today_b = 0
+        self.structural_today_e9ct = 0
+        self.structural_today_et9 = 0
+        self.structural_today_e21c = 0
+        self.structural_today_rst = 0
+        self.structural_today_bucket = "ALL"
+        self.live_struct_rows = 0
+        self.live_struct_rows_raw = 0
+        self.status_message = "LOADING"
+        yield
+        t0 = time.perf_counter()
+        snap = await asyncio.to_thread(lambda: get_engine().snapshot(universe=u_clean))
+        t1 = time.perf_counter()
+        self._hydrate_from_snapshot(snap, t0, t1)
 
     def set_search_query(self, q: str):
         self.search_query = q or ""
